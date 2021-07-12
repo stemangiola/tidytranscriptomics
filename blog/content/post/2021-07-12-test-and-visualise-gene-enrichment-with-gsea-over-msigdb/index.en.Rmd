@@ -1,0 +1,213 @@
+---
+title: "Test and Visualise Gene Enrichment with GSEA over MSigDB"
+author: 'Stefano Mangiola '
+date: '2021-07-12'
+output:
+  html_document:
+    df_print: paged
+categories: Case study
+tags:
+- tidytranscriptomics
+- gene enrichment
+- GSEA
+- MSigDB
+- differential expression
+lastmod: '2021-07-12T12:29:10+10:00'
+keywords: []
+description: ''
+comment: no
+toc: no
+autoCollapseToc: no
+postMetaInFooter: no
+hiddenFromHomePage: no
+contentCopyright: no
+reward: no
+mathjax: no
+mathjaxEnableSingleDollar: no
+mathjaxEnableAutoNumber: no
+hideHeaderAndFooter: no
+flowchartDiagrams:
+  enable: no
+  options: ''
+sequenceDiagrams:
+  enable: no
+  options: ''
+slug: []
+---
+
+```{r message=FALSE, warning=FALSE}
+# dataset
+library(airway)
+
+# tidyverse core packages
+library(tibble)
+library(dplyr)
+library(tidyr)
+library(readr)
+library(stringr)
+library(ggplot2)
+library(purrr)
+
+# tidyverse-friendly packages
+library(plotly)
+library(ggrepel)
+library(GGally)
+library(tidybulk)
+library(tidySummarizedExperiment) # we'll load this below to show what it can do
+library(enrichplot)
+library(patchwork)
+```
+
+tidySummarizedExperiment provides a bridge between Bioconductor [SummarizedExperiment](https://bioconductor.org/packages/release/bioc/html/SummarizedExperiment.html) [@morgan2020summarized] and the tidyverse [@wickham2019welcome]. It enables viewing the
+Bioconductor *SummarizedExperiment* object as a tidyverse tibble, and provides SummarizedExperiment-compatible *dplyr*, *tidyr*, *ggplot* and *plotly* functions. This allows users to get the best of both Bioconductor and tidyverse worlds.
+
+
+Here we will demonstrate performing a bulk RNA sequencing analysis using  *tidySummarizedExperiment* and *tidybulk*. We will use data from the *airway* package, which comes from the paper by [@himes2014rna]. It includes 8 samples from human airway smooth muscle cells, from 4 cell lines. For each cell line treated (with dexamethasone) and untreated (negative control) a sample has undergone RNA sequencing and gene counts have been generated.
+
+
+```{r}
+# load airway RNA sequencing data
+data(airway)
+# take a look
+airway
+```
+
+## Full pipeline
+
+In one modular step it is possible to go from raw counts to enriched pathways
+
+```{r}
+airway %>%
+  
+  # Annotate
+  mutate(entrez = AnnotationDbi::mapIds(org.Hs.eg.db::org.Hs.eg.db,
+                                        keys = feature,
+                                        keytype = "ENSEMBL",
+                                        column = "ENTREZID",
+                                        multiVals = "first"
+  )) %>% 
+
+  # Filter
+  keep_abundant(factor_of_interest = dex) %>%
+  
+  # Test differential gene transcript abundance
+  test_differential_abundance(
+    ~ dex + cell,
+    method="edger_robust_likelihood_ratio", 
+    test_above_log2_fold_change = 1,
+  ) %>% 
+  
+  # Test gene enrichment
+  filter(PValue   %>% is.na %>% `!`) %>%
+  test_gene_rank(
+    .entrez = entrez,
+    .arrange_desc = logFC ,
+    species="Homo sapiens",
+    gene_sets = c("H", "C2", "C5")
+  )
+```
+
+## Step-by-step
+
+We'll set up the airway data for our RNA sequencing analysis. We'll create a column with shorter sample names and a column with entrez ID. We can get the entrez ID for these Ensembl gene ids using the Bioconductor annotation package for human, `org.Hs.eg.db`.
+
+
+```{r}
+# setup data workflow
+counts <-
+  airway %>%
+  mutate(entrez = AnnotationDbi::mapIds(org.Hs.eg.db::org.Hs.eg.db,
+                                        keys = feature,
+                                        keytype = "ENSEMBL",
+                                        column = "ENTREZID",
+                                        multiVals = "first"
+  )) 
+# take a look
+counts
+```
+
+We filter out lowly expressed genes using tidybulk `keep_abundant` or `identify_abundant`. These functions can use the *edgeR* `filterByExpr` function described in [@law2016rna] to automatically identify the genes with adequate abundance for differential expression testing.
+
+
+```{r}
+# Filtering counts
+counts_abundant <- counts %>% 
+      keep_abundant(factor_of_interest = dex) 
+
+# take a look
+counts_abundant
+```
+
+*tidybulk* integrates several popular methods for differential transcript abundance testing: the edgeR quasi-likelihood [@chen2016reads] (tidybulk default method), edgeR likelihood ratio [@mccarthy2012differential], limma-voom [@law2014voom] and DESeq2 [@love2014moderated]. A common question researchers have is which method to choose. With tidybulk, we can easily run multiple methods and compare.
+
+We give `test_differential_abundance` our tidybulk counts object and a formula, specifying the column that contains our groups to be compared. If all our samples were from the same cell line, and there were no additional factors contributing variance, such as batch differences, we could use the formula `~ dex`. However, each treated and untreated sample is from a different cell line, so we add the cell line as an additional factor `~ dex + cell`.
+
+```{r message=FALSE}
+de_all <-
+  counts_abundant %>%
+  test_differential_abundance(
+    ~ dex + cell,
+    method="edger_robust_likelihood_ratio", 
+    test_above_log2_fold_change = 1,
+  ) 
+
+```
+
+Execute `GSEA` using `MSigDB`, `clusterProfiler` and `enrichplot` 
+
+```{r}
+
+de_all_gene_rank = 
+  de_all %>%
+  filter(PValue   %>% is.na %>% `!`) %>%
+  test_gene_rank(
+    .entrez = entrez,
+    .arrange_desc = logFC ,
+    species="Homo sapiens",
+    gene_sets = c("H", "C2", "C5")
+  )
+```
+
+Examine significantly enriched gene sets
+
+```{r}
+de_all_gene_rank %>%
+  filter(gs_cat  == "C2" ) %>%
+  dplyr::select(-fit) %>%
+  unnest(test) %>% 
+  filter(p.adjust < 0.05)
+
+```
+
+Visualise enrichment
+
+```{r}
+de_all_gene_rank_plots = 
+  de_all_gene_rank  %>% 
+    unnest(test) %>% 
+  
+  # Select top 10
+    slice(1:10) %>% 
+    mutate(plot = pmap(
+       list(fit, ID, idx_for_plotting, p.adjust), 
+       ~ enrichplot::gseaplot2(
+           ..1, 
+           geneSetID = ..3, 
+           title = sprintf("%s \nadj pvalue %s", ..2, round(..4, 2)),
+           base_size = 6, rel_heights = c(1.5, 0.5), subplots = c(1, 2)
+       )  
+  ))
+
+# Visualise the first plot
+de_all_gene_rank_plots %>% 
+  pull(plot) %>% 
+  wrap_plots()
+
+```
+
+List all citations used in this analysis
+```{r}
+  get_bibliography(de_all_gene_rank)
+  
+```
+
